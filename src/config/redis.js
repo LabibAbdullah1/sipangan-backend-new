@@ -2,8 +2,9 @@ import { createClient } from 'redis';
 import 'dotenv/config';
 
 const client = createClient({
-    url: process.env.REDIS_URL,
+    // url: process.env.REDIS_URL,
     socket: {
+        path: '/home/sublymyi/redis/redis.sock',
         reconnectStrategy: (retries) => {
             if (retries > 10) {
                 console.error('Redis: Max retries reached. Stopping reconnection.');
