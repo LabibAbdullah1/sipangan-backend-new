@@ -3,83 +3,96 @@ import * as mapService from '../services/mapService.js';
 import * as kaService from '../services/kaService.js';
 import * as integrationService from '../services/integrationService.js';
 
+// Helper untuk memberi jeda (breathing room) bagi CPU & RAM
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 /**
  * Job Utama SIPANGAN (Pekerjaan Belakang Layar)
  * Berjalan setiap jam 12 malam (00:00)
- * Tugas: 
- * 1. Sync data ke model KA (FastAPI)
- * 2. Ambil prediksi terbaru dari model KA
- * 3. Hitung status level hibrida
- * 4. Update Cache Redis untuk Dashboard
  */
 export const runStatusUpdateJob = async () => {
-    console.log('--- STARTING MIDNIGHT KA PROCESSING ---');
+    console.log('--- [KA JOB] STARTING PROCESSING ---');
+    const startTime = Date.now();
     
     try {
         const commodities = await mapService.getAllCommodities();
         const regions = await mapService.getAllRegions();
         
+        console.log(`[KA JOB] Processing ${commodities.length} commodities across ${regions.length} regions...`);
+
         for (const commodity of commodities) {
+            console.log(`[KA JOB] -> Processing commodity: ${commodity.name}`);
             const mapStatus = [];
 
+            // Kita proses region dalam kelompok kecil (misal: 5 region sekaligus) 
+            // atau satu per satu dengan jeda untuk menjaga RAM
             for (const region of regions) {
-                // 1. Ambil data historis terbaru
-                const history = await mapService.getHistoricalPrices(region.id, commodity.id, 30); // Ambil 30 hari terakhir
-                if (history.length === 0) continue;
-
-                // 2. INTEGRASI KA: Push data ke FastAPI & Tarik Prediksi (Pekerjaan Belakang Layar)
                 try {
-                    // Kita kirim data historis ke AI untuk dianalisa
-                    await integrationService.syncDataToKAModel(region.id, commodity.id, history);
-                    
-                    // Kita tarik hasil prediksi terbaru (3 hari ke depan)
-                    await integrationService.fetchAndSyncPredictions(region.id, commodity.id);
-                } catch (aiError) {
-                    console.warn(`AI Integration skipped for region ${region.id}:`, aiError.message);
-                    // Tetap lanjut meskipun AI gagal, menggunakan data yang ada
-                }
+                    // 1. Ambil data historis
+                    const history = await mapService.getHistoricalPrices(region.id, commodity.id, 30);
+                    if (history.length === 0) continue;
 
-                // 3. Ambil data setelah disinkronisasi untuk kalkulasi status
-                const latestPrice = history[0].price;
-                const pricesOnly = history.slice(0, 7).map(h => h.price); // MA 7 hari
-                const ma7 = kaService.calculateMA(pricesOnly);
-
-                // Ambil prediksi KA terbaru dari DB (yang baru saja ditarik dari AI)
-                const predictions = await mapService.getKAPredictions(region.id, commodity.id, 3);
-
-                let kaTrend = 'STABLE';
-                if (predictions.length > 0) {
-                    const predPricesOnly = predictions.map(p => p.price);
-                    const avgPrediction = kaService.calculateMA(predPricesOnly);
-                    if (avgPrediction > latestPrice) {
-                        kaTrend = 'UP';
+                    // 2. INTEGRASI KA: Push & Pull (FastAPI)
+                    try {
+                        await integrationService.syncDataToKAModel(region.id, commodity.id, history);
+                        await integrationService.fetchAndSyncPredictions(region.id, commodity.id);
+                    } catch (aiError) {
+                        // Jika AI gagal, kita tetap lanjut dengan data yang ada
+                        console.warn(`[KA JOB] AI Integration failed for region ${region.id}:`, aiError.message);
                     }
+
+                    // 3. Kalkulasi Status Hibrida
+                    const latestPrice = history[0].price;
+                    const pricesOnly = history.slice(0, 7).map(h => h.price);
+                    const ma7 = kaService.calculateMA(pricesOnly);
+
+                    const predictions = await mapService.getKAPredictions(region.id, commodity.id, 3);
+
+                    let kaTrend = 'STABLE';
+                    if (predictions.length > 0) {
+                        const predPricesOnly = predictions.map(p => p.price);
+                        const avgPrediction = kaService.calculateMA(predPricesOnly);
+                        if (avgPrediction > latestPrice) kaTrend = 'UP';
+                    }
+
+                    const statusLevel = kaService.calculateStatusLevel(
+                        ma7, 
+                        latestPrice, 
+                        commodity.het, 
+                        kaTrend
+                    );
+
+                    mapStatus.push({
+                        region_id: region.id,
+                        region_name: region.name,
+                        latest_price: latestPrice,
+                        status_level: statusLevel
+                    });
+
+                    // BERI JEDA: Sangat penting untuk cPanel 2GB RAM
+                    // Memberi waktu bagi Garbage Collector (GC) untuk bekerja
+                    await sleep(50); 
+
+                } catch (regionError) {
+                    console.error(`[KA JOB] Error processing region ${region.id}:`, regionError.message);
                 }
-
-                const statusLevel = kaService.calculateStatusLevel(
-                    ma7, 
-                    latestPrice, 
-                    commodity.het, 
-                    kaTrend
-                );
-
-                mapStatus.push({
-                    region_id: region.id,
-                    region_name: region.name,
-                    latest_price: latestPrice,
-                    status_level: statusLevel
-                });
             }
 
-            // 4. Update Cache Redis (Untuk performa sub-50ms)
+            // 4. Update Cache Redis
             if (mapStatus.length > 0) {
                 await mapService.updateMapStatusCache(commodity.id, mapStatus);
-                console.log(`Successfully updated Map Status for ${commodity.name}`);
+                console.log(`[KA JOB] Successfully updated cache for ${commodity.name}`);
             }
+
+            // Jeda antar komoditas lebih lama sedikit
+            await sleep(500);
         }
-        console.log('--- MIDNIGHT KA PROCESSING COMPLETED ---');
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+        console.log(`--- [KA JOB] COMPLETED IN ${duration}s ---`);
+
     } catch (error) {
-        console.error('Critical Error in Midnight Job:', error);
+        console.error('[KA JOB] CRITICAL ERROR:', error);
     }
 };
 

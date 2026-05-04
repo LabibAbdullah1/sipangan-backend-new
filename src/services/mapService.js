@@ -5,8 +5,14 @@ import redisClient from '../config/redis.js';
  * Service untuk menangani data pemetaan dan harga (ESM)
  */
 export const getCachedMapStatus = async (commodityId) => {
-    const data = await redisClient.get(`sipangan:map_status:commodity_${commodityId}`);
-    return data ? JSON.parse(data) : null;
+    if (!redisClient.isReady) return null;
+    try {
+        const data = await redisClient.get(`sipangan:map_status:commodity_${commodityId}`);
+        return data ? JSON.parse(data) : null;
+    } catch (err) {
+        console.error('Redis get error:', err.message);
+        return null;
+    }
 };
 
 export const getHistoricalPrices = async (regionId, commodityId, limit = 7) => {
@@ -42,8 +48,13 @@ export const getAllCommodities = async () => {
 };
 
 export const updateMapStatusCache = async (commodityId, data) => {
-    await redisClient.set(
-        `sipangan:map_status:commodity_${commodityId}`,
-        JSON.stringify(data)
-    );
+    if (!redisClient.isReady) return;
+    try {
+        await redisClient.set(
+            `sipangan:map_status:commodity_${commodityId}`,
+            JSON.stringify(data)
+        );
+    } catch (err) {
+        console.error('Redis set error:', err.message);
+    }
 };
